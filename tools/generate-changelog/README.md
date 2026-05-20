@@ -7,7 +7,7 @@ and `Removed`.
 ## Setup
 
 1. Keep `tools/generate-changelog/changelog.sh` in the repository you want to summarize.
-2. Run `bash tools/generate-changelog/changelog.sh`.
+2. From this package root, run `bash changelog.sh`.
 3. Review and commit the generated `CHANGELOG.md`.
 
 ## Behavior
@@ -25,6 +25,9 @@ and `Removed`.
 ## Options
 
 ```bash
+bash changelog.sh --help
+bash changelog.sh --output RELEASE_NOTES.md
+bash changelog.sh --since v1.0.0 --version v1.1.0
 bash tools/generate-changelog/changelog.sh --help
 bash tools/generate-changelog/changelog.sh --output RELEASE_NOTES.md
 bash tools/generate-changelog/changelog.sh --since v1.0.0 --version v1.1.0

@@ -32,3 +32,16 @@ Expected interpretation:
   the baseline checks.
 - Broad tenant-scoped deletes risk cross-tenant data loss and must include
   explicit tenant and authorization filters.
+
+Local validation checklist for a greenfield project:
+
+```text
+Prompt: Read CLAUDE.md and answer only from that file.
+
+Expected:
+[ ] Database code belongs in db/client.ts.
+[ ] New migrations use YYYYMMDDHHMMSS_short_description.sql.
+[ ] Dashboard data components default to Server Components.
+[ ] Completion checks include pnpm lint, pnpm typecheck, focused tests, and pnpm build when relevant.
+[ ] Tenant deletes must include explicit tenant and authorization filters.
+```
