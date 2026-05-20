@@ -102,6 +102,25 @@ class DestructiveBashGuardTest(unittest.TestCase):
     def test_does_not_block_text_that_mentions_rm_rf(self):
         self.assert_allowed("echo 'rm -rf build'")
 
+    def test_ignores_shell_comments_that_mention_rm_rf(self):
+        for command in [
+            "# rm -rf /",
+            "git status # rm -rf /",
+            "echo safe # rm -rf /",
+        ]:
+            with self.subTest(command=command):
+                self.assert_allowed(command)
+
+    def test_preserves_quoted_hash_characters(self):
+        hook = load_hook_module()
+        for command in [
+            "echo '# rm -rf /'",
+            'printf "%s\\n" "# git push --force origin main"',
+        ]:
+            with self.subTest(command=command):
+                self.assertEqual(hook.strip_shell_comments(command), command)
+                self.assert_allowed(command)
+
     def test_blocks_forced_git_push_forms(self):
         for command in [
             "git push --force origin main",

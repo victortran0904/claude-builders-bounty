@@ -51,9 +51,18 @@ def strip_shell_comments(command: str) -> str:
     result: list[str] = []
     quote: str | None = None
     escaped = False
+    in_comment = False
+    at_word_start = True
     for char in command:
+        if in_comment:
+            if char in {"\n", "\r"}:
+                result.append(char)
+                in_comment = False
+                at_word_start = True
+            continue
         if escaped:
             result.append(char)
+            at_word_start = False
             escaped = False
             continue
         if char == "\\" and quote != "'":
@@ -63,11 +72,16 @@ def strip_shell_comments(command: str) -> str:
         if char in {"'", '"'}:
             quote = None if quote == char else char if quote is None else quote
             result.append(char)
+            at_word_start = False
             continue
-        if char == "#" and quote is None:
-            result.append("\n")
+        if char == "#" and quote is None and at_word_start:
+            in_comment = True
             continue
         result.append(char)
+        if quote is None:
+            at_word_start = char.isspace() or char in {";", "&", "|", "(", ")"}
+        else:
+            at_word_start = False
     return "".join(result)
 
 
