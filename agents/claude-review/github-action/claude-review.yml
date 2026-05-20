@@ -1,0 +1,26 @@
+name: Claude Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Generate structured PR review
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+        run: |
+          chmod +x agents/claude-review/claude-review
+          agents/claude-review/claude-review --pr "$PR_URL" --output claude-review.md
+      - uses: actions/upload-artifact@v4
+        with:
+          name: claude-review
+          path: claude-review.md

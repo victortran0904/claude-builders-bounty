@@ -1,0 +1,458 @@
+#!/usr/bin/env python3
+"""Generate a structured Markdown review from a GitHub pull request diff."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+import textwrap
+import urllib.error
+import urllib.request
+from dataclasses import dataclass
+from pathlib import Path
+from urllib.parse import urlparse
+
+
+PR_RE = re.compile(r"^/([^/]+)/([^/]+)/pull/(\d+)")
+SOURCE_EXTENSIONS = {
+    ".c",
+    ".cc",
+    ".cpp",
+    ".cs",
+    ".go",
+    ".java",
+    ".js",
+    ".jsx",
+    ".kt",
+    ".php",
+    ".py",
+    ".rb",
+    ".rs",
+    ".swift",
+    ".ts",
+    ".tsx",
+}
+TEST_MARKERS = {"/test/", "/tests/", "__tests__", ".test.", ".spec.", "_test."}
+ANTHROPIC_VERSION = "2023-06-01"
+DEFAULT_ANTHROPIC_BASE_URL = "https://api.anthropic.com"
+DEFAULT_ANTHROPIC_MODEL = "claude-sonnet-4-20250514"
+DEFAULT_ANTHROPIC_MAX_TOKENS = 1200
+DEFAULT_ANTHROPIC_MAX_DIFF_CHARS = 60000
+
+
+@dataclass(frozen=True)
+class PrRef:
+    owner: str
+    repo: str
+    number: str
+
+
+@dataclass
+class FileChange:
+    path: str
+    added: int = 0
+    removed: int = 0
+    added_lines: list[tuple[int | None, str]] | None = None
+
+    def __post_init__(self) -> None:
+        if self.added_lines is None:
+            self.added_lines = []
+
+
+def parse_pr_url(url: str) -> PrRef:
+    parsed = urlparse(url)
+    if parsed.netloc.lower() != "github.com":
+        raise ValueError("PR URL must be on github.com")
+    match = PR_RE.match(parsed.path)
+    if not match:
+        raise ValueError("PR URL must look like https://github.com/owner/repo/pull/123")
+    return PrRef(*match.groups())
+
+
+def fetch_pr_diff(pr: PrRef, token: str | None) -> str:
+    request = urllib.request.Request(
+        f"https://api.github.com/repos/{pr.owner}/{pr.repo}/pulls/{pr.number}",
+        headers={
+            "Accept": "application/vnd.github.v3.diff",
+            "User-Agent": "claude-review",
+        },
+    )
+    if token:
+        request.add_header("Authorization", f"Bearer {token}")
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            return response.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(f"GitHub returned HTTP {exc.code} while fetching the PR diff") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"could not fetch PR diff: {exc.reason}") from exc
+
+
+def parse_diff(diff_text: str) -> list[FileChange]:
+    files: list[FileChange] = []
+    current: FileChange | None = None
+    new_line_number: int | None = None
+
+    for line in diff_text.splitlines():
+        if line.startswith("diff --git "):
+            path = line.rsplit(" b/", 1)[-1] if " b/" in line else line.split()[-1]
+            current = FileChange(path=path)
+            files.append(current)
+            new_line_number = None
+            continue
+        if current is None:
+            continue
+        if line.startswith("@@"):
+            match = re.search(r"\+(\d+)(?:,\d+)?", line)
+            new_line_number = int(match.group(1)) if match else None
+            continue
+        if line.startswith("+++") or line.startswith("---"):
+            continue
+        if line.startswith("+"):
+            current.added += 1
+            current.added_lines.append((new_line_number, line[1:]))
+            if new_line_number is not None:
+                new_line_number += 1
+            continue
+        if line.startswith("-"):
+            current.removed += 1
+            continue
+        if new_line_number is not None:
+            new_line_number += 1
+    return files
+
+
+def is_test_path(path: str) -> bool:
+    normalized = f"/{path.lower()}"
+    return any(marker in normalized for marker in TEST_MARKERS)
+
+
+def risk_signals(files: list[FileChange]) -> list[str]:
+    risks: list[str] = []
+    changed_paths = [file.path for file in files]
+    changed_lower = [path.lower() for path in changed_paths]
+    added_total = sum(file.added for file in files)
+    removed_total = sum(file.removed for file in files)
+
+    if any(path.endswith(("package-lock.json", "pnpm-lock.yaml", "yarn.lock", "requirements.txt")) for path in changed_lower):
+        risks.append("Dependency or lockfile changes can alter the runtime supply chain; verify provenance and compatibility.")
+    if any(("auth" in path or "session" in path or "permission" in path or "rbac" in path) for path in changed_lower):
+        risks.append("Authentication or authorization code changed; confirm negative permission paths and tenant boundaries are tested.")
+    if any(("migration" in path or "/db/" in path or "schema" in path) for path in changed_lower):
+        risks.append("Database or schema code changed; check rollback behavior, migration ordering, and data-preservation paths.")
+    if any(("webhook" in path or "payment" in path or "billing" in path) for path in changed_lower):
+        risks.append("Webhook, payment, or billing paths changed; validate signature checks and idempotency.")
+    if added_total + removed_total > 800:
+        risks.append(f"The diff is large ({added_total} additions, {removed_total} deletions), so review risk is higher and focused tests matter.")
+
+    for file in files:
+        for line_no, line in file.added_lines or []:
+            lower = line.lower()
+            location = f"`{file.path}`" + (f":{line_no}" if line_no is not None else "")
+            if re.search(r"(api[_-]?key|secret|token|password)\s*[:=]\s*['\"][^'\"]{8,}", lower):
+                risks.append(f"{location} appears to introduce a hard-coded secret-like value.")
+            if "eval(" in lower or "new function(" in lower:
+                risks.append(f"{location} introduces dynamic code execution; verify the input cannot be user-controlled.")
+            if "innerhtml" in lower or "dangerouslysetinnerhtml" in lower:
+                risks.append(f"{location} writes raw HTML; verify sanitization and XSS coverage.")
+            if re.search(r"delete\s+from\s+\w+\s*;?$", lower) and " where " not in lower:
+                risks.append(f"{location} appears to delete database rows without a WHERE clause.")
+            if "todo" in lower or "fixme" in lower:
+                risks.append(f"{location} adds TODO/FIXME text; decide whether it is acceptable before merge.")
+
+    if not risks:
+        risks.append("No obvious high-risk patterns were found from the diff alone.")
+    return risks[:8]
+
+
+def suggestions(files: list[FileChange]) -> list[str]:
+    changed_source = [
+        file.path
+        for file in files
+        if Path(file.path).suffix.lower() in SOURCE_EXTENSIONS and not is_test_path(file.path)
+    ]
+    changed_tests = [file.path for file in files if is_test_path(file.path)]
+    suggestions_out: list[str] = []
+
+    if changed_source and not changed_tests:
+        suggestions_out.append("Add or update focused tests for the changed source paths before merge.")
+    if changed_tests:
+        suggestions_out.append("Run the touched test files plus the closest integration or smoke test for the edited feature.")
+    suggestions_out.append("Confirm the PR description names the user-visible behavior change and any rollback concerns.")
+    suggestions_out.append("Verify formatting, linting, and type checks for the touched stack.")
+
+    docs_changed = any(path.lower().endswith((".md", ".mdx", ".rst")) for path in (file.path for file in files))
+    if docs_changed:
+        suggestions_out.append("For documentation changes, verify examples against the current CLI/API rather than relying on stale snippets.")
+    return suggestions_out[:6]
+
+
+def confidence(files: list[FileChange], risks: list[str]) -> str:
+    changed_total = sum(file.added + file.removed for file in files)
+    source_without_tests = any(
+        Path(file.path).suffix.lower() in SOURCE_EXTENSIONS and not is_test_path(file.path) for file in files
+    ) and not any(is_test_path(file.path) for file in files)
+    high_risk = any("hard-coded secret" in risk or "dynamic code execution" in risk for risk in risks)
+
+    if high_risk or changed_total > 1000 or source_without_tests:
+        return "Medium"
+    if changed_total < 250 and len(files) <= 8:
+        return "High"
+    return "Medium"
+
+
+def render_review(pr_url: str, files: list[FileChange]) -> str:
+    changed_total = sum(file.added + file.removed for file in files)
+    added_total = sum(file.added for file in files)
+    removed_total = sum(file.removed for file in files)
+    risks = risk_signals(files)
+    improvement_suggestions = suggestions(files)
+    score = confidence(files, risks)
+    top_files = sorted(files, key=lambda file: file.added + file.removed, reverse=True)[:5]
+
+    file_summary = ", ".join(f"`{file.path}` (+{file.added}/-{file.removed})" for file in top_files)
+    summary = (
+        f"This review analyzed {len(files)} changed files with {added_total} additions and {removed_total} deletions. "
+        f"The largest touched paths are {file_summary or 'not available'}. "
+        f"Risk level is driven by diff size, touched domains, and whether tests appear in the patch."
+    )
+
+    lines = [
+        "## Claude PR Review",
+        "",
+        f"PR: {pr_url}",
+        "",
+        "### Summary",
+        "",
+        textwrap.fill(summary, width=100),
+        "",
+        "### Identified Risks",
+        "",
+    ]
+    lines.extend(f"- {risk}" for risk in risks)
+    lines.extend(["", "### Improvement Suggestions", ""])
+    lines.extend(f"- {suggestion}" for suggestion in improvement_suggestions)
+    lines.extend(["", f"### Confidence Score: {score}", ""])
+    return "\n".join(lines)
+
+
+def truncate_text(text: str, max_chars: int) -> str:
+    if max_chars <= 0:
+        return "[diff omitted because max diff chars was set to 0]"
+    if len(text) <= max_chars:
+        return text
+    head_chars = max_chars // 2
+    tail_chars = max_chars - head_chars
+    return (
+        text[:head_chars]
+        + "\n\n[... diff truncated for Anthropic request ...]\n\n"
+        + text[-tail_chars:]
+    )
+
+
+def build_anthropic_prompt(pr_url: str, diff_text: str, heuristic_review: str, max_diff_chars: int) -> str:
+    diff_for_prompt = truncate_text(diff_text, max_diff_chars)
+    return textwrap.dedent(
+        f"""
+        Review this GitHub pull request diff and return only a Markdown review.
+
+        Requirements:
+        - Use exactly this top-level title: ## Claude PR Review
+        - Include these sections: ### Summary, ### Identified Risks, ### Improvement Suggestions, ### Confidence Score: Low|Medium|High
+        - Be specific about changed files and line numbers when the diff provides them.
+        - Do not invent files, tests, behavior, or runtime facts not supported by the diff.
+        - Keep the review concise and actionable.
+
+        PR: {pr_url}
+
+        Deterministic heuristic baseline:
+        {heuristic_review}
+
+        Diff:
+        ```diff
+        {diff_for_prompt}
+        ```
+        """
+    ).strip()
+
+
+def extract_anthropic_text(payload: dict) -> str:
+    content = payload.get("content")
+    if not isinstance(content, list):
+        raise RuntimeError("Anthropic response did not include content")
+
+    text_parts = []
+    for block in content:
+        if isinstance(block, dict) and block.get("type") == "text" and isinstance(block.get("text"), str):
+            text_parts.append(block["text"].strip())
+
+    text = "\n\n".join(part for part in text_parts if part)
+    if not text:
+        raise RuntimeError("Anthropic response did not include text content")
+    return text
+
+
+def has_required_review_sections(review: str) -> bool:
+    required = [
+        "## Claude PR Review",
+        "### Summary",
+        "### Identified Risks",
+        "### Improvement Suggestions",
+        "### Confidence Score:",
+    ]
+    return all(section in review for section in required)
+
+
+def generate_anthropic_review(
+    pr_url: str,
+    diff_text: str,
+    heuristic_review: str,
+    *,
+    api_key: str,
+    model: str,
+    base_url: str,
+    max_tokens: int,
+    max_diff_chars: int,
+) -> str:
+    endpoint = base_url.rstrip("/") + "/v1/messages"
+    payload = {
+        "model": model,
+        "max_tokens": max_tokens,
+        "system": (
+            "You are Claude reviewing GitHub pull request diffs for correctness, security, "
+            "maintainability, and test risk. Return only the requested Markdown review."
+        ),
+        "messages": [
+            {
+                "role": "user",
+                "content": build_anthropic_prompt(pr_url, diff_text, heuristic_review, max_diff_chars),
+            }
+        ],
+    }
+    request = urllib.request.Request(
+        endpoint,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "anthropic-version": ANTHROPIC_VERSION,
+            "content-type": "application/json",
+            "User-Agent": "claude-review",
+            "x-api-key": api_key,
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            response_body = response.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(f"Anthropic returned HTTP {exc.code}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"could not call Anthropic: {exc.reason}") from exc
+
+    try:
+        review = extract_anthropic_text(json.loads(response_body))
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("Anthropic returned invalid JSON") from exc
+    if not has_required_review_sections(review):
+        raise RuntimeError("Anthropic response did not include the required review sections")
+    return review
+
+
+def env_int(name: str, default: int) -> int:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer") from exc
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    try:
+        default_anthropic_max_tokens = env_int("ANTHROPIC_MAX_TOKENS", DEFAULT_ANTHROPIC_MAX_TOKENS)
+        default_anthropic_max_diff_chars = env_int("ANTHROPIC_MAX_DIFF_CHARS", DEFAULT_ANTHROPIC_MAX_DIFF_CHARS)
+    except ValueError as exc:
+        parser.error(str(exc))
+
+    parser.add_argument("--pr", help="GitHub pull request URL")
+    parser.add_argument("--diff-file", help="Read a local diff file instead of fetching from GitHub")
+    parser.add_argument("--output", help="Write Markdown review to this path")
+    parser.add_argument(
+        "--model",
+        default=os.environ.get("ANTHROPIC_MODEL", DEFAULT_ANTHROPIC_MODEL),
+        help=f"Anthropic model to use when ANTHROPIC_API_KEY is set (default: {DEFAULT_ANTHROPIC_MODEL})",
+    )
+    parser.add_argument(
+        "--anthropic-base-url",
+        default=os.environ.get("ANTHROPIC_BASE_URL", DEFAULT_ANTHROPIC_BASE_URL),
+        help=f"Anthropic API base URL (default: {DEFAULT_ANTHROPIC_BASE_URL})",
+    )
+    parser.add_argument(
+        "--anthropic-max-tokens",
+        type=int,
+        default=default_anthropic_max_tokens,
+        help=f"Maximum Claude output tokens when using Anthropic (default: {DEFAULT_ANTHROPIC_MAX_TOKENS})",
+    )
+    parser.add_argument(
+        "--anthropic-max-diff-chars",
+        type=int,
+        default=default_anthropic_max_diff_chars,
+        help=f"Maximum diff characters sent to Anthropic (default: {DEFAULT_ANTHROPIC_MAX_DIFF_CHARS})",
+    )
+    parser.add_argument(
+        "--no-anthropic",
+        action="store_true",
+        help="Force the offline deterministic heuristic review even when ANTHROPIC_API_KEY is set",
+    )
+    args = parser.parse_args(argv)
+
+    if not args.pr and not args.diff_file:
+        parser.error("provide --pr or --diff-file")
+    if args.anthropic_max_tokens <= 0:
+        parser.error("--anthropic-max-tokens must be greater than 0")
+    if args.anthropic_max_diff_chars < 0:
+        parser.error("--anthropic-max-diff-chars must be greater than or equal to 0")
+
+    pr_url = args.pr or "local diff"
+    try:
+        if args.diff_file:
+            diff_text = Path(args.diff_file).read_text(encoding="utf-8")
+        else:
+            diff_text = fetch_pr_diff(parse_pr_url(args.pr), os.environ.get("GITHUB_TOKEN"))
+    except (OSError, RuntimeError, ValueError) as exc:
+        print(f"claude-review: {exc}", file=sys.stderr)
+        return 1
+
+    files = parse_diff(diff_text)
+    review = render_review(pr_url, files)
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if api_key and not args.no_anthropic:
+        try:
+            review = generate_anthropic_review(
+                pr_url,
+                diff_text,
+                review,
+                api_key=api_key,
+                model=args.model,
+                base_url=args.anthropic_base_url,
+                max_tokens=args.anthropic_max_tokens,
+                max_diff_chars=args.anthropic_max_diff_chars,
+            )
+        except RuntimeError as exc:
+            print(f"claude-review: Anthropic review failed ({exc}); using heuristic fallback", file=sys.stderr)
+
+    if args.output:
+        Path(args.output).parent.mkdir(parents=True, exist_ok=True)
+        Path(args.output).write_text(review, encoding="utf-8")
+    else:
+        print(review)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
