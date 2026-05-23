@@ -181,15 +181,13 @@ removed=
 commit_count=0
 separator=$(printf '\037')
 
-while IFS="$separator" read -r hash subject; do
+while IFS="$separator" read -r hash subject || [ -n "$hash" ]; do
   [ -n "$hash" ] || continue
   commit_count=$((commit_count + 1))
   category=$(categorize_subject "$subject")
   summary=$(strip_conventional_prefix "$subject")
   append_item "$category" "- ${summary} (${hash})"$'\n'
-done <<EOF
-$(git -C "$git_root" log --no-merges --pretty=format:'%h%x1f%s' "$range")
-EOF
+done < <(git -C "$git_root" log --no-merges --pretty=format:'%h%x1f%s' "$range")
 
 output_dir=$(dirname "$output_path")
 mkdir -p "$output_dir"

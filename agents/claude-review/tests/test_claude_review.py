@@ -33,6 +33,10 @@ class ClaudeReviewTest(unittest.TestCase):
         self.assertEqual(ref.repo, "repo")
         self.assertEqual(ref.number, "123")
 
+    def test_parse_pr_url_rejects_trailing_segments(self):
+        with self.assertRaises(ValueError):
+            self.mod.parse_pr_url("https://github.com/owner/repo/pull/123/files")
+
     def test_render_review_has_required_sections(self):
         diff = """diff --git a/app/auth.ts b/app/auth.ts
 --- a/app/auth.ts
@@ -50,6 +54,20 @@ class ClaudeReviewTest(unittest.TestCase):
         self.assertIn("### Confidence Score:", review)
         self.assertIn("hard-coded secret", review)
         self.assertIn("dynamic code execution", review)
+
+    def test_confidence_is_low_for_high_risk_or_large_diff(self):
+        secret_files = self.mod.parse_diff(
+            """diff --git a/app/auth.ts b/app/auth.ts
+--- a/app/auth.ts
++++ b/app/auth.ts
+@@ -1 +1,2 @@
++const token = "secret-token-value";
+"""
+        )
+        large_files = [self.mod.FileChange(path="app.py", added=1001, removed=0)]
+
+        self.assertEqual(self.mod.confidence(secret_files, self.mod.risk_signals(secret_files)), "Low")
+        self.assertEqual(self.mod.confidence(large_files, ["No obvious high-risk patterns were found."]), "Low")
 
     def test_generate_anthropic_review_uses_messages_api(self):
         captured = {}

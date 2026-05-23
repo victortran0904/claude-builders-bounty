@@ -16,7 +16,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 
-PR_RE = re.compile(r"^/([^/]+)/([^/]+)/pull/(\d+)")
+PR_RE = re.compile(r"^/([^/]+)/([^/]+)/pull/(\d+)/?$")
 SOURCE_EXTENSIONS = {
     ".c",
     ".cc",
@@ -197,7 +197,9 @@ def confidence(files: list[FileChange], risks: list[str]) -> str:
     ) and not any(is_test_path(file.path) for file in files)
     high_risk = any("hard-coded secret" in risk or "dynamic code execution" in risk for risk in risks)
 
-    if high_risk or changed_total > 1000 or source_without_tests:
+    if high_risk or changed_total > 1000:
+        return "Low"
+    if source_without_tests:
         return "Medium"
     if changed_total < 250 and len(files) <= 8:
         return "High"

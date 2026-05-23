@@ -138,20 +138,20 @@
     },
     {
       "parameters": {
-        "url": "={{($env.GITHUB_API_BASE_URL || 'https://api.github.com') + '/repos/' + $node['Build Config'].json.repo + '/pulls'}}",
+        "url": "={{($env.GITHUB_API_BASE_URL || 'https://api.github.com') + '/search/issues'}}",
         "sendQuery": true,
         "queryParameters": {
           "parameters": [
             {
-              "name": "state",
-              "value": "closed"
+              "name": "q",
+              "value": "={{'repo:' + $node['Build Config'].json.repo + ' is:pr is:merged merged:>=' + $node['Build Config'].json.since.slice(0, 10)}}"
             },
             {
               "name": "sort",
               "value": "updated"
             },
             {
-              "name": "direction",
+              "name": "order",
               "value": "desc"
             },
             {
@@ -186,7 +186,7 @@
     },
     {
       "parameters": {
-        "jsCode": "const config = $items('Build Config')[0].json;\nconst commits = $items('Fetch Commits').map((item) => item.json).flat();\nconst rawIssues = $items('Fetch Closed Issues').map((item) => item.json).flat();\nconst rawPulls = $items('Fetch Merged PRs').map((item) => item.json).flat();\nconst issues = rawIssues.filter((issue) => !issue.pull_request && issue.closed_at >= config.since);\nconst pulls = rawPulls.filter((pr) => pr.merged_at && pr.merged_at >= config.since);\nconst facts = {\n  repo: config.repo,\n  period: { since: config.since, until: config.until },\n  commits: commits.slice(0, 50).map((commit) => ({ sha: commit.sha?.slice(0, 7), message: commit.commit?.message?.split('\\n')[0], author: commit.commit?.author?.name })),\n  closedIssues: issues.slice(0, 30).map((issue) => ({ number: issue.number, title: issue.title, labels: (issue.labels || []).map((label) => label.name) })),\n  mergedPullRequests: pulls.slice(0, 30).map((pr) => ({ number: pr.number, title: pr.title, author: pr.user?.login, additions: pr.additions, deletions: pr.deletions }))\n};\nconst languageLine = config.language === 'FR' ? 'Write the summary in French.' : 'Write the summary in English.';\nconst prompt = `${languageLine}\\n\\nCreate a concise weekly engineering narrative for ${config.repo}. Include: introduction, highlights, risks/blockers, and next steps. Be specific and avoid inventing work.\\n\\nActivity JSON:\\n${JSON.stringify(facts, null, 2)}`;\nreturn [{ json: { ...config, facts, prompt } }];"
+        "jsCode": "const config = $items('Build Config')[0].json;\nconst commits = $items('Fetch Commits').map((item) => item.json).flat();\nconst rawIssues = $items('Fetch Closed Issues').map((item) => item.json).flat();\nconst rawPullPayloads = $items('Fetch Merged PRs').map((item) => item.json);\nconst rawPulls = rawPullPayloads.flatMap((payload) => Array.isArray(payload) ? payload : (payload.items || []));\nconst issues = rawIssues.filter((issue) => !issue.pull_request && issue.closed_at >= config.since);\nconst pulls = rawPulls.filter((pr) => pr.pull_request);\nconst facts = {\n  repo: config.repo,\n  period: { since: config.since, until: config.until },\n  commits: commits.slice(0, 50).map((commit) => ({ sha: commit.sha?.slice(0, 7), message: commit.commit?.message?.split('\\n')[0], author: commit.commit?.author?.name })),\n  closedIssues: issues.slice(0, 30).map((issue) => ({ number: issue.number, title: issue.title, labels: (issue.labels || []).map((label) => label.name) })),\n  mergedPullRequests: pulls.slice(0, 30).map((pr) => ({ number: pr.number, title: pr.title, author: pr.user?.login, mergedAt: pr.closed_at, url: pr.html_url }))\n};\nconst languageLine = config.language === 'FR' ? 'Write the summary in French.' : 'Write the summary in English.';\nconst prompt = languageLine + '\\n\\nCreate a concise weekly engineering narrative for ' + config.repo + '. Include: introduction, highlights, risks/blockers, and next steps. Be specific and avoid inventing work.\\n\\nActivity JSON:\\n' + JSON.stringify(facts, null, 2);\nreturn [{ json: { ...config, facts, prompt } }];"
       },
       "id": "16b94179-d868-442a-a44d-3db47e9eb080",
       "name": "Build Claude Prompt",
