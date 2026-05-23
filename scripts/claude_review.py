@@ -14,15 +14,18 @@ from urllib.error import HTTPError, URLError
 
 USER_AGENT = "claude-review-agent/0.1"
 SECURITY_KEYWORDS = (
-    "auth",
-    "token",
-    "password",
-    "secret",
-    "permission",
-    "oauth",
-    "jwt",
-    "crypto",
-    "encrypt",
+    r"auth(?:enticat\w*|oriz\w*)?",
+    r"token\w*",
+    r"password\w*",
+    r"secret\w*",
+    r"permission\w*",
+    r"oauth\w*",
+    r"jwt",
+    r"crypto\w*",
+    r"encrypt\w*",
+)
+SECURITY_KEYWORD_PATTERN = re.compile(
+    r"(?<![a-z0-9])(?:" + "|".join(SECURITY_KEYWORDS) + r")(?![a-z0-9])"
 )
 DEPENDENCY_FILES = {
     "requirements.txt",
@@ -35,16 +38,24 @@ DEPENDENCY_FILES = {
     "yarn.lock",
     "go.mod",
     "go.sum",
-    "Cargo.toml",
-    "Cargo.lock",
-    "Gemfile",
-    "Gemfile.lock",
+    "cargo.toml",
+    "cargo.lock",
+    "gemfile",
+    "gemfile.lock",
     "composer.json",
     "composer.lock",
 }
 LOCKFILE_SUFFIXES = (".lock",)
 MIGRATION_TOKENS = ("migrations", "alembic", "db/migrate")
 CI_TOKENS = (".github/workflows", "circleci", ".gitlab-ci")
+LARGE_FILE_COUNT = 25
+MEDIUM_FILE_COUNT = 15
+LARGE_LINE_COUNT = 1200
+SUBSTANTIAL_LINE_COUNT = 400
+MISSING_TEST_LINE_COUNT = 80
+MEDIUM_LINE_COUNT = 500
+VERY_LARGE_LINE_COUNT = 2500
+LOW_CONFIDENCE_SIGNAL_COUNT = 3
 
 
 @dataclass(frozen=True)
@@ -141,6 +152,15 @@ def _has_test_files(files: List[str]) -> bool:
     return False
 
 
+def _security_touched(diff_text: str) -> bool:
+    return SECURITY_KEYWORD_PATTERN.search(diff_text.lower()) is not None
+
+
+def _count_text(count: int, singular: str, plural: str | None = None) -> str:
+    label = singular if count == 1 else plural or f"{singular}s"
+    return f"{count} {label}"
+
+
 def analyze_pr(metadata: Dict[str, Any], diff_text: str) -> Dict[str, Any]:
     files = extract_changed_files(diff_text)
     additions, deletions = diff_line_stats(diff_text)
@@ -149,11 +169,10 @@ def analyze_pr(metadata: Dict[str, Any], diff_text: str) -> Dict[str, Any]:
     deletions = int(metadata.get("deletions") or deletions)
     commits = int(metadata.get("commits") or 0)
 
-    lower_diff = diff_text.lower()
     lower_files = [f.lower() for f in files]
 
     tests_present = _has_test_files(files)
-    security_touched = any(keyword in lower_diff for keyword in SECURITY_KEYWORDS)
+    security_touched = _security_touched(diff_text)
     ci_touched = any(any(token in path for token in CI_TOKENS) for path in lower_files)
     dependency_touched = any(os.path.basename(path) in DEPENDENCY_FILES for path in lower_files)
     migration_touched = any(any(token in path for token in MIGRATION_TOKENS) for path in lower_files)
@@ -163,9 +182,9 @@ def analyze_pr(metadata: Dict[str, Any], diff_text: str) -> Dict[str, Any]:
     total_changed_lines = additions + deletions
 
     risks: List[str] = []
-    if changed_files >= 25 or total_changed_lines >= 1200:
+    if changed_files >= LARGE_FILE_COUNT or total_changed_lines >= LARGE_LINE_COUNT:
         risks.append("Large PR footprint increases regression risk and reviewer blind spots.")
-    if total_changed_lines >= 400:
+    if total_changed_lines >= SUBSTANTIAL_LINE_COUNT:
         risks.append("Substantial code churn may hide edge-case failures.")
     if security_touched:
         risks.append("Security/auth-related code appears in the diff and needs focused review.")
@@ -177,7 +196,7 @@ def analyze_pr(metadata: Dict[str, Any], diff_text: str) -> Dict[str, Any]:
         risks.append("CI/workflow definitions changed; verify pipeline behavior and permissions.")
     if deleted_file_count > 0:
         risks.append("File deletions detected; ensure removed logic has no runtime references.")
-    if not tests_present and total_changed_lines >= 80:
+    if not tests_present and total_changed_lines >= MISSING_TEST_LINE_COUNT:
         risks.append("No test files detected despite non-trivial changes.")
     if lockfile_count > 0 and lockfile_count == len(lower_files):
         risks.append("PR appears lockfile-only; verify this was intentionally generated from clean dependency updates.")
@@ -196,25 +215,25 @@ def analyze_pr(metadata: Dict[str, Any], diff_text: str) -> Dict[str, Any]:
         suggestions.append("Pin and scan updated dependencies, and include rationale for major version bumps.")
     if ci_touched:
         suggestions.append("Run CI with least-privilege checks for updated workflow files before merge.")
-    if changed_files >= 25 or total_changed_lines >= 1200:
+    if changed_files >= LARGE_FILE_COUNT or total_changed_lines >= LARGE_LINE_COUNT:
         suggestions.append("Consider splitting this PR into smaller, reviewable units.")
     if not suggestions:
         suggestions.append("Run full CI and smoke tests before merge to validate runtime behavior.")
 
     strong_risk_signals = sum(
         [
-            changed_files >= 25,
-            total_changed_lines >= 1200,
+            changed_files >= LARGE_FILE_COUNT,
+            total_changed_lines >= LARGE_LINE_COUNT,
             security_touched,
             migration_touched,
             ci_touched,
             dependency_touched,
-            (not tests_present and total_changed_lines >= 80),
+            (not tests_present and total_changed_lines >= MISSING_TEST_LINE_COUNT),
         ]
     )
-    if strong_risk_signals >= 3 or total_changed_lines >= 2500:
+    if strong_risk_signals >= LOW_CONFIDENCE_SIGNAL_COUNT or total_changed_lines >= VERY_LARGE_LINE_COUNT:
         confidence = "Low"
-    elif strong_risk_signals >= 1 or total_changed_lines >= 500 or changed_files >= 15:
+    elif strong_risk_signals >= 1 or total_changed_lines >= MEDIUM_LINE_COUNT or changed_files >= MEDIUM_FILE_COUNT:
         confidence = "Medium"
     else:
         confidence = "High"
@@ -230,6 +249,14 @@ def analyze_pr(metadata: Dict[str, Any], diff_text: str) -> Dict[str, Any]:
         "suggestions": suggestions,
         "confidence": confidence,
         "total_changed_lines": total_changed_lines,
+        "signals": {
+            "security_touched": security_touched,
+            "ci_touched": ci_touched,
+            "dependency_touched": dependency_touched,
+            "migration_touched": migration_touched,
+            "deleted_file_count": deleted_file_count,
+            "lockfile_count": lockfile_count,
+        },
     }
 
 
@@ -242,8 +269,10 @@ def build_summary(metadata: Dict[str, Any], analysis: Dict[str, Any]) -> str:
 
     sentence1 = f"This PR, \"{title}\", proposes merging `{head_ref}` into `{base_ref}`."
     sentence2 = (
-        f"It spans {analysis['changed_files']} files with {analysis['additions']} additions and "
-        f"{analysis['deletions']} deletions across {analysis['commits']} commits."
+        f"It spans {_count_text(analysis['changed_files'], 'file')} with "
+        f"{_count_text(analysis['additions'], 'addition')} and "
+        f"{_count_text(analysis['deletions'], 'deletion')} across "
+        f"{_count_text(analysis['commits'], 'commit')}."
     )
     sentence3 = f"Primary touched paths include {touched_preview}, and the diff {tests_text}."
     return " ".join([sentence1, sentence2, sentence3])
