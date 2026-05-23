@@ -45,6 +45,19 @@ def run_hook(home: Path, command: str, tool_name: str = "Bash", hook_event_name:
     )
 
 
+def run_hook_with_payload(home: Path, payload: dict):
+    env = os.environ.copy()
+    env["HOME"] = str(home)
+    return subprocess.run(
+        [sys.executable, str(HOOK)],
+        input=json.dumps(payload),
+        text=True,
+        capture_output=True,
+        env=env,
+        check=False,
+    )
+
+
 class DestructiveBashGuardTest(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -95,6 +108,16 @@ class DestructiveBashGuardTest(unittest.TestCase):
 
     def test_blocks_nested_bash_login_command_rm_rf(self):
         self.assert_denied("bash -lc 'rm -rf /tmp/project'", "rm -rf")
+
+    def test_blocks_rm_rf_around_compact_and_separator(self):
+        for command in [
+            "echo ok&&rm -rf build",
+            "rm -rf build&&echo ok",
+            "echo ok&rm -rf build",
+        ]:
+            with self.subTest(command=command):
+                self.assert_denied(command, "rm -rf")
+                self.log_path().unlink()
 
     def test_blocks_xargs_rm_rf_with_xargs_option(self):
         self.assert_denied("printf '%s\\0' target | xargs -0 rm -rf", "rm -rf")
@@ -173,6 +196,25 @@ class DestructiveBashGuardTest(unittest.TestCase):
         self.assertEqual(result.stdout, "")
         self.assertFalse(self.log_path().exists())
 
+    def test_accepts_camel_case_payload_keys(self):
+        result = run_hook_with_payload(
+            self.home,
+            {
+                "session_id": "test-session",
+                "transcript_path": str(self.home / "transcript.jsonl"),
+                "cwd": str(self.home / "project"),
+                "hookEventName": "PreToolUse",
+                "toolName": "Bash",
+                "toolInput": {"command": "rm -rf build"},
+            },
+        )
+
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stderr, "")
+        output = json.loads(result.stdout)
+        self.assertEqual(output["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertTrue(self.log_path().exists())
+
     def test_installer_merges_bash_hook_without_overwriting_existing_settings(self):
         settings_path = self.home / ".claude" / "settings.json"
         settings_path.parent.mkdir(parents=True)
@@ -215,6 +257,41 @@ class DestructiveBashGuardTest(unittest.TestCase):
         bash_matchers = [matcher for matcher in matchers if matcher.get("matcher") == "Bash"]
         self.assertEqual(len(bash_matchers), 1)
         self.assertIn(str(installed_hook), bash_matchers[0]["hooks"][0]["command"])
+
+    def test_installer_normalizes_unexpected_hook_settings_types(self):
+        settings_path = self.home / ".claude" / "settings.json"
+        settings_path.parent.mkdir(parents=True)
+        settings_path.write_text(
+            json.dumps(
+                {
+                    "hooks": {
+                        "PreToolUse": {
+                            "matcher": "Bash",
+                            "hooks": {"type": "command", "command": "echo old"},
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        env = os.environ.copy()
+        env["HOME"] = str(self.home)
+
+        result = subprocess.run(
+            [sys.executable, str(INSTALLER)],
+            text=True,
+            capture_output=True,
+            env=env,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0)
+        settings = json.loads(settings_path.read_text(encoding="utf-8"))
+        matchers = settings["hooks"]["PreToolUse"]
+        self.assertIsInstance(matchers, list)
+        bash_matchers = [matcher for matcher in matchers if matcher.get("matcher") == "Bash"]
+        self.assertEqual(len(bash_matchers), 1)
+        self.assertIn("destructive-bash-guard.py", bash_matchers[0]["hooks"][0]["command"])
 
     def test_logging_failure_does_not_prevent_denial(self):
         hook = load_hook_module()

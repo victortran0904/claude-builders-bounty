@@ -39,15 +39,33 @@ def install_hook() -> None:
 
 
 def merge_settings(settings: dict) -> dict:
-    hooks = settings.setdefault("hooks", {})
-    pre_tool_use = hooks.setdefault("PreToolUse", [])
+    hooks = settings.get("hooks")
+    if not isinstance(hooks, dict):
+        hooks = {}
+        settings["hooks"] = hooks
+
+    pre_tool_use = hooks.get("PreToolUse")
+    if not isinstance(pre_tool_use, list):
+        pre_tool_use = []
+        hooks["PreToolUse"] = pre_tool_use
+
     command = shlex.quote(str(TARGET_HOOK))
 
     for matcher in pre_tool_use:
+        if not isinstance(matcher, dict):
+            continue
         if matcher.get("matcher") != "Bash":
             continue
-        matcher_hooks = matcher.setdefault("hooks", [])
-        if not any(hook.get("type") == "command" and hook.get("command") == command for hook in matcher_hooks):
+        matcher_hooks = matcher.get("hooks")
+        if not isinstance(matcher_hooks, list):
+            matcher_hooks = []
+            matcher["hooks"] = matcher_hooks
+        if not any(
+            isinstance(hook, dict)
+            and hook.get("type") == "command"
+            and hook.get("command") == command
+            for hook in matcher_hooks
+        ):
             matcher_hooks.append({"type": "command", "command": command})
         return settings
 

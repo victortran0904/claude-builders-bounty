@@ -14,7 +14,7 @@ from pathlib import Path
 
 
 LOG_PATH = Path.home() / ".claude" / "hooks" / "blocked.log"
-SEPARATORS = {";", "&&", "||", "|"}
+SEPARATORS = {";", "&", "&&", "||", "|"}
 WRAPPERS = {"sudo", "command", "builtin", "time", "noglob"}
 SHELLS = {"bash", "sh", "zsh", "dash", "ksh"}
 SQL_CLIENTS = {"psql", "mysql", "mariadb", "sqlite3", "sqlcmd", "duckdb", "cockroach"}
@@ -401,11 +401,14 @@ def deny(decision: BlockDecision) -> None:
 
 def main() -> int:
     payload = read_payload()
-    if payload.get("hook_event_name") not in {None, "PreToolUse"}:
+    hook_event_name = payload.get("hook_event_name", payload.get("hookEventName"))
+    if hook_event_name not in {None, "PreToolUse"}:
         return 0
-    if payload.get("tool_name") not in {None, "Bash"}:
+    tool_name = payload.get("tool_name", payload.get("toolName"))
+    if tool_name not in {None, "Bash"}:
         return 0
-    tool_input = payload.get("tool_input") if isinstance(payload.get("tool_input"), dict) else {}
+    raw_tool_input = payload.get("tool_input", payload.get("toolInput"))
+    tool_input = raw_tool_input if isinstance(raw_tool_input, dict) else {}
     command = tool_input.get("command") or payload.get("command") or ""
     if not isinstance(command, str) or not command.strip():
         return 0
